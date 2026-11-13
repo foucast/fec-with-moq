@@ -154,7 +154,7 @@ async def main(a):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--relay", default="moqt://moqx-main.ci.openmoq.org:4433")
+    p.add_argument("--relay", default="moqt://lb.moqx.akaleapi.net:443/moq-relay")  # OpenMoQ public relays (issue #1)
     p.add_argument("--ns", required=True)
     p.add_argument("--draft", type=int, default=16, help="MoQT draft (16 for moqx, 18 for MOQtail)")
     p.add_argument("--seed", type=int, default=7)

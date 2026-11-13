@@ -40,6 +40,10 @@ mkdir -p certs && openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj /CN=
 python scripts/loopback_fec.py      # source + 3 repair tracks over loopback, no relay
 ```
 
+Through a relay, the tools default to OpenMoQ's public relays, `moqt://lb.moqx.akaleapi.net:443/moq-relay`: the name routes you to the nearest one. The publisher needs raw QUIC (`moqt://`), because aiomoqt can't send datagrams over WebTransport; a subscriber can also use `https://lb.moqx.akaleapi.net/moq-relay`. Pass `--relay` to use your own.
+
+Tested on Ubuntu 24.04. If it doesn't work on your system, please open an issue, and if you can fix it, send a pull request from your fork.
+
 The coder is ISA-L (Cauchy Reed–Solomon). An older zfec backend is kept as an optional comparison; it isn't installed by default because zfec is GPL-2+.
 
 ## Design

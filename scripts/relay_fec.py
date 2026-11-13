@@ -1305,7 +1305,9 @@ def main():
     sp = p.add_subparsers(dest="role", required=True)
 
     def common(q):
-        q.add_argument("--relay", default="moqt://moqx-main.ci.openmoq.org:4433")
+        # OpenMoQ's public relays: GTM routes the name to the nearest one (issue #1).
+        # Raw QUIC (moqt://) for pub; sub also takes https://lb.moqx.akaleapi.net/moq-relay.
+        q.add_argument("--relay", default="moqt://lb.moqx.akaleapi.net:443/moq-relay")
         q.add_argument("--draft", type=parse_draft_spec, default=16)
         q.add_argument("--insecure", action="store_true", help="skip TLS verification of the relay")
         q.add_argument("--ns", required=True, help="per-run namespace, one token")
