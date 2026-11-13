@@ -6,7 +6,7 @@ Background, in plain language: the FEC with MoQ article series on LinkedIn, [Par
 
 ## Status
 
-Working end to end: the Python publisher sends real media (source plus repair tracks) through a stock [moqx](https://github.com/openmoq/moqx) relay, and browser players recover lost blocks in stock Chromium and Firefox. The player changes (for [Playa](https://github.com/openmoq/moq-playa) and Shaka Player) will be published in forks of those players.
+Working end to end: the Python publisher sends real media (source plus repair tracks) through a stock [moqx](https://github.com/openmoq/moqx) relay, and browser players recover lost blocks in stock Chromium and Firefox. The player side is in Playa: branch [`fec-with-moq`](https://github.com/foucast/moq-playa/tree/fec-with-moq) of our fork, which has a demo page with an on-screen FEC counter (see its `FEC-WITH-MOQ.md`). The Shaka Player changes will follow in a fork of Shaka.
 
 Not yet shown: congestion with real cross traffic, bitrate and protection chosen together, content-aware protection, or multicast.
 
