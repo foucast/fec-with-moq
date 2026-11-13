@@ -1,0 +1,12 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>fec-decoder timing</title>
+<pre id="out">running…</pre>
+<script type="module">
+  // Decoder unit timing in the browser: same core as Node. Serve web/fec-decoder/ and build first (tsc).
+  import { runBench } from "../dist/bench/bench-core.js";
+  const v = await (await fetch("../test/vectors.json")).json();
+  const rows = runBench(v);
+  window.benchResult = { userAgent: navigator.userAgent, rows };
+  document.getElementById("out").textContent = JSON.stringify(window.benchResult, null, 1);
+</script>

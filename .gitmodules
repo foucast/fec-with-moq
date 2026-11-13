@@ -1,0 +1,3 @@
+[submodule "vendor/aiomoqt"]
+	path = vendor/aiomoqt
+	url = https://github.com/gmarzot/aiomoqt.git

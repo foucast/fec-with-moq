@@ -1,0 +1,22 @@
+[project]
+name = "fec-with-moq"
+version = "0.0.1"
+description = "Receiver-declared FEC over MoQ: layered repair tracks selected by SUBSCRIBE"
+requires-python = ">=3.12"
+# aiomoqt is NOT listed here: it is a submodule at vendor/aiomoqt,
+# installed editable by scripts/setup.sh. Its own deps (aiopquic, certifi,
+# sortedcontainers) come from PyPI automatically.
+# The default coder is ISA-L, loaded from the system library (apt install libisal-dev),
+# so there are no PyPI dependencies. zfec (GPL-2+) is an optional comparison backend
+# and is deliberately not listed: install it yourself if you want it.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
