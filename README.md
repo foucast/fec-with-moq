@@ -83,6 +83,10 @@ cmp out.ts test60.ts
 - `--source-mapping datagram` (source objects as datagrams, FEC + FETCH) gives the lowest lateness under random loss; `group` (a stream per group) is the choice for bursty loss with a long window.
 - A publisher whose relay session dies stops and exits with status 4 (`SESSION-DEAD`) instead of queueing; `--keepalive` keeps a session up while it waits for the gate.
 
+Known issues, MPEG-TS (Nov 2026; fixes to follow):
+- A subscriber can write an output that is short by the tail of a group while reporting 0 objects lost: when a group's last objects never arrive and its length is unknown, nothing fetches or counts them. Check the output with `cmp` against the input, not only the loss count.
+- `replace` needs null packets near a group's start; a stream without stuffing gets no PAT/PMT copies in those groups.
+
 ## Design
 
 How the MoQ tracks are laid out (source on subgroup streams, repair rungs on datagrams, FETCH as a fallback) is in [`DESIGN.md`](DESIGN.md). Start there rather than with the code.
