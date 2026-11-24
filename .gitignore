@@ -11,3 +11,8 @@ build/
 captures/
 results/
 certs/
+
+# MPEG-TS test vectors and run outputs (not *.ts: that is also TypeScript)
+vectors/
+out.ts
+*.m2ts

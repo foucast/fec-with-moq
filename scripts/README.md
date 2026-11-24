@@ -6,7 +6,7 @@ Run from the repository root, after `scripts/setup.sh`.
 |---|---|
 | `setup.sh` | One-shot setup: virtual environment, aiomoqt (editable, from the submodule), this package |
 | `loopback_fec.py` | Source plus repair tracks over real MoQT on one machine, no relay. The quickest way to see it work |
-| `relay_fec.py` | The main tool, through a relay: `pub` publishes source and repair tracks, `sub` subscribes and logs every arrival, `analyze` reconstructs blocks offline at chosen deadlines |
+| `relay_fec.py` | The main tool, through a relay: `pub` publishes source and repair tracks (synthetic blocks, real media with the three-track catalog, or MPEG-TS), `sub` subscribes, logs every arrival and can write the TS back out, `analyze` reconstructs blocks offline at chosen deadlines |
 | `pub_media_mapped.py` | aiomoqt's LOC media publisher with one stream per object, for the no-FEC baseline |
 | `fetch_check.py` | Checks that FETCH works through a relay for these tracks |
 | `fetch_range.py` | FETCH through a relay, by range or joining, checked object by object |

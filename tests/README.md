@@ -12,3 +12,6 @@ Run with `python -m pytest tests/ -q` from the repository root. Tests that need 
 | `test_fetch_objects.py` | Repair by FETCH, the publisher's side |
 | `test_fetch_server.py` | FETCH answered by the publisher |
 | `test_aiomoqt_compat.py` | The aiomoqt internals this code hooks into still have the shape it expects |
+| `test_three_track_catalog.py` | The three-track catalog: plain track, FEC source and repair tracks, packagingMetadata |
+| `test_ts.py` | MPEG-TS: objects and groups, PAT/PMT copies, reassembly with loss, FEC and FETCH, the publisher's session watchdog |
+| `test_arrivals.py` | The subscriber's arrival records read back as they were written |

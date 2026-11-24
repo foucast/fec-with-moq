@@ -4,7 +4,7 @@ A small TypeScript decoder for our repair objects, for a browser player. It matc
 backend of `src/fecmoq/codec.py` and the wire format of `src/fecmoq/wire.py`. No runtime
 dependencies; the TypeScript toolchain only for type-checking and building.
 
-**What it is:** the decoder and its unit tests/timings. Nothing here receives MoQ objects. The FEC stages in our Playa and Shaka Player forks use it (not yet published).
+**What it is:** the decoder and its unit tests/timings. Nothing here receives MoQ objects. The FEC stage in our Playa fork ([foucast/moq-playa](https://github.com/foucast/moq-playa), branch `fec-with-moq-v2`) uses it; our Shaka Player fork's will too (not yet published).
 
 ## The code it decodes
 

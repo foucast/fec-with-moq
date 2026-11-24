@@ -67,6 +67,7 @@ from aiomoqt.utils.url import parse_relay_url  # noqa: E402
 
 import fecmoq.moq as fmoq  # noqa: E402
 import fecmoq.symbols as fsym  # noqa: E402
+from fecmoq.arrivals import Arrivals, Size  # noqa: E402
 from fecmoq.codec import Coder  # noqa: E402
 from fecmoq.moq import SOURCE_TRACK, make_block, repair_track_name, rung_slices  # noqa: E402
 from aiomoqt.delivery import StreamMapping  # noqa: E402
@@ -109,7 +110,7 @@ def client_for(a):
         ka = getattr(a, "keepalive", 0) or None
         return MOQTClient(r.host, r.port, path=r.path or "", use_quic=False,
                           supported_drafts=a.draft, verify_tls=not a.insecure, qlog_dir=qlog or None,
-                          keep_alive_interval=ka)
+                          keep_alive_interval=ka, congestion_control_algorithm=getattr(a, "cc", None))
     # --qlog-dir: picoquic writes a qlog of this connection (every frame, incl. the
     # MAX_STREAMS credit a subscriber grants). Diagnostic runs only: it costs CPU.
     qlog = getattr(a, "qlog_dir", None)
@@ -122,7 +123,7 @@ def client_for(a):
     ka = getattr(a, "keepalive", 0) or None     # QUIC PING interval; keeps an idle session (gate wait) up
     return MOQTClient(r.host, r.port, path=path, use_quic=True,
                       supported_drafts=a.draft, verify_tls=not a.insecure, qlog_dir=qlog or None,
-                      keep_alive_interval=ka)
+                      keep_alive_interval=ka, congestion_control_algorithm=getattr(a, "cc", None))
 
 
 # --------------------------------------------------------------------- publisher
@@ -130,6 +131,48 @@ def client_for(a):
 async def wait_for_file(path, poll=0.05):
     while not os.path.exists(path):
         await asyncio.sleep(poll)
+
+
+def psi_summary(p) -> str:
+    """TS-PUB-END's account of replaced PAT/PMT copies ('' unless replace mode)."""
+    if p.psi_mode != "replace":
+        return ""
+    off = sorted(p.psi_null_offsets)
+    where = (f"offset_p50={off[len(off) // 2]} offset_max={off[-1]} " if off else "")
+    return (f"psi_mode=replace psi_skipped={p.psi_skipped} psi_superseded={p.psi_superseded} "
+            f"{where}groups={p.groups + 1} ")
+
+
+def session_dead(session, limit0: int):
+    """Why the session is dead, or None: aiomoqt recorded a close, or the datagram limit,
+    `limit0` after the handshake, has fallen to 0 (the transport is gone)."""
+    err = getattr(session, "_close_err", None)
+    if err is not None:
+        return f"closed, code {err[0]} {err[1]!r}"
+    if limit0 > 0 and session.datagram_max_payload() == 0:
+        return "the datagram limit fell to 0: the transport is gone"
+    return None
+
+
+async def watch_session(session, limit0: int, poll: float = 0.5) -> str:
+    """Returns why, once the session is dead (session_dead)."""
+    while (why := session_dead(session, limit0)) is None:
+        await asyncio.sleep(poll)
+    return why
+
+
+async def unless_dead(aw, dead: asyncio.Future, what: str, served=None):
+    """Awaits `aw`; if the session dies first, says so and exits with status 4 instead of
+    producing into lanes nobody drains."""
+    task = asyncio.ensure_future(aw)
+    await asyncio.wait({task, dead}, return_when=asyncio.FIRST_COMPLETED)
+    if task.done():
+        return task.result()
+    task.cancel()
+    held = sum(ln.bytes for tr in (served or {}).values()
+               for ln in (getattr(getattr(tr, "_out", None), "lanes", None) or []))
+    say(f"SESSION-DEAD {what}: {dead.result()}; lanes held {held} B; exiting (status 4)")
+    os._exit(4)
 
 
 class _Stamped:
@@ -185,7 +228,7 @@ def gated(cls, gate, sends):
     class Gated(cls):
         async def produce(self, out):
             await gate.wait()
-            await super().produce(_Stamped(out, self.trackname, sends))
+            await super().produce(out if sends is None else _Stamped(out, self.trackname, sends))
     Gated.__name__ = f"Gated{cls.__name__}"
     return Gated
 
@@ -231,6 +274,9 @@ class PrioSubscribedTrack(SubscribedTrack):
         self.state = TrackState.SUBSCRIBED
 
 
+_Size = Size     # the name the arrivals pickles of earlier runs refer to
+
+
 async def run_pub(a):
     """Announce the namespace, then serve each upstream SUBSCRIBE from the relay
     with ONE session-level handler that dispatches on track name -- the same shape
@@ -250,7 +296,77 @@ async def run_pub(a):
     total = a.warmup + a.blocks
     if a.pace_source and a.source_mapping != "datagram":
         sys.exit("--pace-source paces datagram source symbols: it needs --source-mapping datagram")
-    if getattr(a, "media", None):
+    ts_src = getattr(a, "ts", None)
+    if ts_src:
+        # MPEG-TS: GPAC in-process, objects of 7 TS packets, a group per
+        # random access point, FEC blocks of --objects consecutive objects of a group
+        from fecmoq.ts import catalog_json as ts_catalog_json
+        from fecmoq.ts_moq import TsSchedule, gpac_ts_reader, gpac_version
+        if a.source_mapping not in ("group", "object", "datagram") or a.repair_mapping != "datagram" \
+                or a.mirror_mapping != "none" or a.repair_ids != "global" or a.repair_group_per_symbol:
+            sys.exit("--ts: source on streams (--source-mapping group|object) or one object per "
+                     "datagram (--source-mapping datagram), repair as datagrams with global ids, "
+                     "no mirror")
+        # Datagram source: each object is one object datagram, so it must fit aiomoqt's
+        # datagram payload ceiling (1,152 B): 6 TS packets (1,128 B), not the 7 (1,316 B) of
+        # stream source. Still whole TS packets, as msfts 5.1 asks; msfts doesn't fix how many.
+        from fecmoq.wire import DATAGRAM_MAX_PAYLOAD
+        if a.ts_packets is None:
+            a.ts_packets = DATAGRAM_MAX_PAYLOAD // 188 if a.source_mapping == "datagram" else 7
+        if a.source_mapping == "datagram" and 188 * a.ts_packets > DATAGRAM_MAX_PAYLOAD:
+            sys.exit(f"--ts-packets {a.ts_packets}: {188 * a.ts_packets} B objects are over the "
+                     f"{DATAGRAM_MAX_PAYLOAD} B datagram ceiling; at most {DATAGRAM_MAX_PAYLOAD // 188}")
+        live = ts_src == "avgen" or "://" in ts_src
+        if not live:
+            from fecmoq.ts import ts_file_info
+            finfo = ts_file_info(ts_src)
+        if a.ts_rate is None:
+            # a file's own mean rate (PCR), not a fixed one: it sizes a block's nominal period
+            a.ts_rate = int(finfo["rate_bps"]) if not live and finfo["rate_bps"] else 6_000_000
+        from fecmoq.ts import psi_each_group_default
+        if a.ts_psi_each_group is None:
+            a.ts_psi_each_group = psi_each_group_default(ts_src)
+            psi_why = "default for this source"
+        else:
+            psi_why = "set on the command line"
+        how = {"off": "off", "insert": "on, inserted (adds 2 packets per group)",
+               "replace": f"on, in place of null packets (within {a.ts_psi_null_window} packets of "
+                          f"the group start; rate and PCR positions kept)"}[a.ts_psi_each_group]
+        say(f"TS PAT/PMT copies at each group start: {how} "
+            f"({psi_why}; on by default only where we write the mux, so a carried TS stays byte-identical)")
+        schedule = TsSchedule(block_objects=a.objects, rung_fracs=a.rungs,
+                              nominal_rate_bps=a.ts_rate, pace=not live,
+                              drop_until_rap="://" in ts_src, psi_each_group=a.ts_psi_each_group,
+                              psi_null_window=a.ts_psi_null_window, log=say,
+                              packets_per_object=a.ts_packets)
+        say(f"TS source {ts_src} "
+            f"{f'via GPAC {gpac_version()} (Python bindings, in-process); live' if live else 'file, read as is and paced by PCR'}; blocks of {a.objects} objects of "
+            f"{a.ts_packets} TS packets; source {a.source_mapping}")
+        if not live:
+            # read a piece at a time and paced by PCR (TsSchedule.feed_file): a long
+            # recording can be larger than memory
+            rate_B = (finfo["rate_bps"] or a.ts_rate) / 8
+            start = int(a.ts_skip_s * rate_B) // 188 * 188
+            length = (int(a.ts_max_s * rate_B) // 188 * 188) if a.ts_max_s else None
+            if a.ts_skip_s or a.ts_max_s:
+                say(f"TS file range: bytes {start}..{start + length if length else finfo['size']} "
+                    f"(--ts-skip-s {a.ts_skip_s:g} --ts-max-s {a.ts_max_s or 0:g} at the mean rate)")
+            feed_task = asyncio.ensure_future(schedule.feed_file(ts_src, start=start, length=length))
+            feed_task.add_done_callback(
+                lambda t: t.cancelled() or t.exception() is None
+                or say(f"TS-FEED-ERROR {t.exception()!r}"))
+            pcr_pid = finfo["pcr_pid"]
+            schedule.bytes_total = finfo["size"]
+            say(f"TS file {finfo['size']} B, read as it is sent; video PID {finfo['video_pid']}, "
+                f"PCR PID {pcr_pid}, SCTE-35 PIDs {finfo['scte35_pids']}; mean rate {finfo['rate_bps'] and round(finfo['rate_bps'])} b/s "
+                f"(PCR); nominal rate {a.ts_rate} b/s")
+        else:
+            pcr_pid = None
+        catalog = ts_catalog_json(source=SOURCE_TRACK, rungs=a.rungs, block_objects=a.objects,
+                                  symbol_size=fsym.SYMBOL_SIZE, mux_rate=a.ts_rate,
+                                  pcr_pid=pcr_pid, object_stride=fmoq.OBJECT_STRIDE,
+                                  scte35_pids=finfo["scte35_pids"] if not live else ())
+    elif getattr(a, "media", None):
         # Shaka phase 2: real LOC frames, blocks of --objects frames,
         # a MoQ group per GOP of --gop-frames (default: one block per GOP)
         from fecmoq.media import MediaBlockSchedule, catalog_json
@@ -274,14 +390,23 @@ async def run_pub(a):
         schedule = fmoq.BlockSchedule(seed=a.seed, n_blocks=total, n_objects=a.objects,
                                       gap_s=a.gap, rung_fracs=a.rungs, gop=a.gop)
         catalog = None
-    common = dict(seed=a.seed, n_blocks=total, n_objects=a.objects, gap_s=a.gap,
+    # --ts: the number of blocks comes from the stream, not from --warmup/--blocks; the tracks
+    # run until the TS ends (TsSchedule.n_blocks is open-ended)
+    common = dict(seed=a.seed, n_blocks=schedule.n_blocks if ts_src else total,
+                  n_objects=a.objects, gap_s=schedule.gap_s if ts_src else a.gap,
                   schedule=schedule)
     rung_of = {repair_track_name(r): r for r in range(1, len(a.rungs) + 1)}
     served = {}
     ending = []          # (track, session, relay request id) to end at exit
-    sends = {}           # (track, group, object) -> [t_produce, t_hand, t_done], monotonic
+    # (track, group, object) -> [t_produce, t_hand, t_done], monotonic: one entry per object
+    # of every track, kept to the end of the run (it grows with the object rate). Off by default for
+    # a TS source, whose checks don't read it (--send-times turns it on)
+    if a.send_times is None:
+        a.send_times = not ts_src
+    sends = {} if a.send_times else None
     alias_name = {}
-    stamp_deliveries(alias_name, sends)
+    if sends is not None:
+        stamp_deliveries(alias_name, sends)
 
     async def on_subscribe(session, msg):
         name = (msg.track_name or b"").decode()
@@ -295,6 +420,14 @@ async def run_pub(a):
             def make():
                 return gated(PlainTrack, gate, sends)(session, name=name, schedule=schedule,
                                                       n_blocks=total)
+            prio = a.prio_src
+        elif name == SOURCE_TRACK and ts_src:
+            from fecmoq.ts_moq import TsSourceTrack
+            mapping = {"group": StreamMapping.PER_GROUP, "object": StreamMapping.PER_OBJECT,
+                       "datagram": StreamMapping.DATAGRAM}[a.source_mapping]
+            src_cls = type("TsSrc", (TsSourceTrack,), {"mapping": mapping})
+            def make():
+                return gated(src_cls, gate, sends)(session, **common)
             prio = a.prio_src
         elif name == SOURCE_TRACK:
             src_cls = {"group": fmoq.SourceTrack, "object": fmoq.ObjectSourceTrack,
@@ -385,13 +518,15 @@ async def run_pub(a):
     # answered from the schedule (fmoq.ScheduleHistory) through aiomoqt's own PublishedTrack FETCH
     # code, one fmoq.FetchServer per track name -- whether or not anyone subscribed to it, since the
     # relay sends upstream the FETCH of a rung it never saw. --fetch-window seconds of blocks are held.
-    window_blocks = max(1, round(a.fetch_window / a.gap))
+    # blocks of --fetch-window seconds: the TS schedule's own block period, not --gap
+    window_blocks = max(1, round(a.fetch_window / (schedule.gap_s if ts_src else a.gap)))
     fetchers = {}
     joins = {}           # relay's SUBSCRIBE request id -> (track, Largest Location when it arrived)
 
     def fetch_spec(name):
         if name == SOURCE_TRACK:
-            return fmoq.FetchSpec(kind="source", source_mapping=a.source_mapping), a.prio_src
+            mapping = "object-datagram" if ts_src and a.source_mapping == "datagram" else a.source_mapping
+            return fmoq.FetchSpec(kind="source", source_mapping=mapping), a.prio_src
         if name == MIRROR_TRACK and a.mirror_mapping != "none":
             return fmoq.FetchSpec(kind="mirror", mapping={"datagram": StreamMapping.DATAGRAM,
                                                           "object": StreamMapping.PER_OBJECT}[a.mirror_mapping]), a.prio_src
@@ -462,7 +597,7 @@ async def run_pub(a):
         session.register_handler(MOQTMessageType.SUBSCRIBE, on_subscribe)
         if a.serve_fetch:
             session.register_handler(MOQTMessageType.FETCH, on_fetch)
-            sizes = [len(o) for o in schedule.block(0)]
+            sizes = [len(o) for o in schedule.block(0)] if not ts_src or schedule.tb.blocks else [0]
             say(f"FETCH serving on: window {a.fetch_window:g} s = {window_blocks} blocks of every track "
                 f"(source, mirror, rungs; recomputed from the schedule, no byte bound; ~{window_blocks * sum(sizes) / 1e6:.1f} MB "
                 f"of source at block 0's size); no END_OF_GROUP status objects in the answers")
@@ -476,7 +611,8 @@ async def run_pub(a):
         say(f"PUBLISHED-ALL namespace announced; serving src + rep1..rep{len(a.rungs)} "
             f"on demand; waiting for gate {a.gate_file}")
 
-        await wait_for_file(a.gate_file)
+        dead = asyncio.ensure_future(watch_session(session, session.datagram_max_payload()))
+        await unless_dead(wait_for_file(a.gate_file), dead, "before the gate opened")
         gate.set()
         t0 = time.monotonic()
         # picoquic's cumulative wire counters for the ONE connection this publisher has,
@@ -494,10 +630,76 @@ async def run_pub(a):
             await asyncio.sleep(0.05)
             return (qc.bytes_sent, qc.bytes_received)
         up0 = await wire()
+        samples = []
+        sampler = None
+        if getattr(a, "pub_sample", 0):
+            # --pub-sample S: every S seconds, picoquic's view of the one connection (cwnd,
+            # bytes in flight, RTT, pacing rate, losses, cumulative bytes on the wire) and each
+            # served track's send lane (live bytes queued, bytes the transport holds, objects
+            # shed, what a waiting send is parked on). A send stall then shows which side holds
+            # the data: the lane (session not taking it) or the transport (cwnd/pacing/flow).
+            async def sample():
+                qc = getattr(session, "_quic", None)
+                # --pub-sample-backlog B: lanes only until a lane holds B bytes (queued + held
+                # by the transport: a send stall under way), then picoquic too, so a stall's
+                # cwnd is on record without reads that could keep it from starting
+                lanes_only = a.pub_sample_lanes_only or a.pub_sample_backlog > 0
+                while True:
+                    row = {"t": round(time.monotonic() - t0, 3)}
+                    if lanes_only and a.pub_sample_backlog > 0 and any(
+                            ln.bytes + ln.tx_bytes >= a.pub_sample_backlog
+                            for tr in served.values()
+                            for ln in (getattr(getattr(tr, "_out", None), "lanes", None) or [])):
+                        lanes_only = False
+                        say(f"PUB-SAMPLE backlog >= {a.pub_sample_backlog} B at {row['t']} s: "
+                            f"reading picoquic from now on")
+                    try:
+                        # --pub-sample-lanes-only: no picoquic reads. Each read posts a refresh
+                        # event to aiopquic's worker thread, which wakes it.
+                        q = (qc.path_quality() if qc is not None and hasattr(qc, "path_quality")
+                             and not lanes_only else {})
+                        for k in ("cwin", "bytes_in_transit", "rtt", "rtt_min", "pacing_rate", "lost",
+                                  "timer_losses", "spurious_losses", "sent"):
+                            if k in q:
+                                row[k] = q[k]
+                        if qc is not None and hasattr(qc, "bytes_sent") and not lanes_only:
+                            row["wire_tx"] = qc.bytes_sent
+                    except Exception as exc:        # noqa: BLE001  diagnostic only
+                        row["err"] = repr(exc)
+                    for name, tr in served.items():
+                        out = getattr(tr, "_out", None)
+                        for i, ln in enumerate(getattr(out, "lanes", []) or []):
+                            row[f"{name}.{i}"] = (ln.bytes, ln.tx_bytes, ln.shed, ln.parked, len(ln.items))
+                    samples.append(row)
+                    await asyncio.sleep(a.pub_sample)
+            sampler = asyncio.ensure_future(sample())
         say(f"CODER {schedule.coder} {schedule.encode_mode} repair-after={schedule.repair_after}")
-        say(f"GATE-OPEN producing {a.warmup} warm-up + {a.blocks} measured blocks "
-            f"x {a.objects} objects, gap {a.gap}s")
-        await asyncio.sleep(total * a.gap + a.linger)
+        if ts_src:
+            say(f"GATE-OPEN producing the TS: blocks of up to {a.objects} objects, nominal "
+                f"{1e3 * schedule.gap_s:.1f} ms each")
+        else:
+            say(f"GATE-OPEN producing {a.warmup} warm-up + {a.blocks} measured blocks "
+                f"x {a.objects} objects, gap {a.gap}s")
+        if ts_src:
+            if live:
+                loop = asyncio.get_running_loop()
+                from fecmoq.ts_moq import gpac_ts_child
+                start = gpac_ts_child if a.ts_gpac_child else gpac_ts_reader
+                start(ts_src, lambda d: loop.call_soon_threadsafe(schedule.push_bytes, d),
+                      lambda: loop.call_soon_threadsafe(schedule.end),
+                      mux_rate=a.ts_rate, live_dur=a.ts_dur)
+                say(f"GPAC live source started ({ts_src}, {a.ts_dur:g} s, "
+                    f"{'child process' if a.ts_gpac_child else 'in-process thread'})")
+            await unless_dead(schedule.ended.wait(), dead, "while producing the TS", served)
+            say(f"TS-PUB-END objects={schedule.objects_in} groups={schedule.tb.group + 1} "
+                f"blocks={len(schedule.tb.blocks)} bytes_in={schedule.bytes_in} "
+                f"psi_copies={schedule.packetizer.psi_inserted} {psi_summary(schedule.packetizer)}"
+                f"sha256={schedule.sha256} "
+                f"evicted_blocks={schedule.evicted} evicted_reads={schedule.evicted_reads}")
+            await asyncio.sleep(a.linger)
+        else:
+            await unless_dead(asyncio.sleep(total * a.gap + a.linger), dead, "while producing", served)
+        dead.cancel()
         up1 = await wire()
         up = {"bytes_sent": up1[0] - up0[0], "bytes_received": up1[1] - up0[1]}
         say(f"UPSTREAM-STREAM-DATA picoquic stream data only (no datagrams, no framing), gate "
@@ -534,6 +736,13 @@ async def run_pub(a):
         if a.serve_fetch:
             say(f"  FETCH: {dict(fetch_stats) or 'none received'}")
         os.makedirs(a.out, exist_ok=True)
+        if sampler is not None:
+            sampler.cancel()
+            with open(os.path.join(a.out, "pub.samples.json"), "w") as f:
+                json.dump(samples, f)
+            say(f"  pub samples: {len(samples)} -> pub.samples.json")
+        if sends is None:
+            sends = {}
         if a.repair_group_per_symbol:
             # record repair as (rung, block, global index), as every other mapping does
             sends = {((k[0], k[1] // fmoq.GROUP_STRIDE, k[1] % fmoq.GROUP_STRIDE)
@@ -550,8 +759,10 @@ async def run_pub(a):
                              repair_eog=a.repair_eog, spread_source=a.spread_source, upstream=up,
                              symbol_size=fsym.SYMBOL_SIZE, pace_repair=a.pace_repair,
                              prio_src=a.prio_src, prio_rep=a.prio_rep,
+                             send_times=a.send_times,
                              sends={k: tuple(v) for k, v in sends.items()}), f)
-        say(f"  send times recorded for {len(sends)} objects -> {a.out}/pub.sends.pkl")
+        say(f"  send times recorded for {len(sends)} objects -> {a.out}/pub.sends.pkl"
+            + ("" if a.send_times else " (off: --no-send-times, the default for a TS source)"))
         enc = sorted(schedule.encode_s.values())
         tot = sorted(schedule.encode_total_s.values())
         if enc:
@@ -579,7 +790,7 @@ def arrival_mode(msg, subgroup_id):
 
 
 async def run_sub(a):
-    recs = []          # (track, group, object, mode, t_mono, payload)
+    recs = Arrivals(keep_payloads=not a.arrival_sizes)   # (track, group, object, mode, t_mono, payload)
     status_objs = defaultdict(int)
     mismatches = []
     first_t = None
@@ -609,11 +820,26 @@ async def run_sub(a):
                 stopped.append((sid, name, g, sg, -1.0))
                 say(f"STOP_SENDING stream {sid} failed: {exc!r}")
 
+    reasm = tsout = None
+    if getattr(a, "ts_out", ""):
+        from fecmoq.ts import TsOutput, TsReassembler
+        reasm = TsReassembler(a.objects, window=a.ts_window, fetch=a.ts_fetch,
+                              fetch_wait=a.ts_fetch_wait, stride=fmoq.OBJECT_STRIDE)
+        tsout = TsOutput(a.ts_out)
+
     def make_cb(track):
         def cb(msg, consumed, now, group_id, subgroup_id=None):
             nonlocal first_t
             t = time.monotonic()
             st = getattr(msg, "status", ObjectStatus.NORMAL)
+            if reasm is not None:
+                if track == SOURCE_TRACK:
+                    if st == ObjectStatus.NORMAL:
+                        reasm.add_source(group_id, msg.object_id, bytes(msg.payload), t)
+                    elif st in (ObjectStatus.END_OF_GROUP, ObjectStatus.END_OF_TRACK):
+                        reasm.end_of_group(group_id, msg.object_id, t)
+                elif st == ObjectStatus.NORMAL:
+                    reasm.add_repair(group_id, msg.object_id, bytes(msg.payload), t)
             if st != ObjectStatus.NORMAL:
                 # END_OF_GROUP and friends come through the same callback. Never data
                 # (milestone 2b's first-run bug). Counted, not stored.
@@ -639,7 +865,8 @@ async def run_sub(a):
                     oid = idx
                 if a.repair_group_per_symbol:
                     group_id //= fmoq.GROUP_STRIDE   # group = block * stride + index
-            recs.append((track, group_id, oid, mode, t, bytes(msg.payload)))
+            recs.append((track, group_id, oid, mode, t,
+                         Size(len(msg.payload)) if a.arrival_sizes else bytes(msg.payload)))
             if a.adaptive and track == SOURCE_TRACK:
                 src_seen[group_id].add(msg.object_id)
                 src_first.setdefault(group_id, t)
@@ -794,6 +1021,31 @@ async def run_sub(a):
                         since = max(g for g in after if judged[g])
                 await asyncio.sleep(0.05)
         adapt_task = asyncio.ensure_future(adapt()) if a.adaptive else None
+        ts_task = None
+        fetch_log = []
+        if reasm is not None:
+            def on_fetch_obj(msg, size, now, request_id):
+                if getattr(msg, "end_of_range", None) is not None:
+                    return
+                if getattr(msg, "status", ObjectStatus.NORMAL) != ObjectStatus.NORMAL:
+                    return
+                reasm.add_source(msg.group_id, msg.object_id, bytes(msg.payload or b""),
+                                 time.monotonic(), how="fetched")
+            session.on_fetch_object = on_fetch_obj
+
+            async def ts_pump():
+                while True:
+                    reasm.poll(time.monotonic(), tsout.write)
+                    for g, o0, o1 in reasm.want_fetch():
+                        try:
+                            session.fetch(namespace=a.ns, track_name=a.source_track, start_group=g,
+                                          start_object=o0, end_group=g, end_object=o1,
+                                          wait_response=False)
+                            fetch_log.append((time.monotonic(), g, o0, o1, "sent"))
+                        except Exception as exc:     # noqa: BLE001
+                            fetch_log.append((time.monotonic(), g, o0, o1, repr(exc)))
+                    await asyncio.sleep(0.005)
+            ts_task = asyncio.ensure_future(ts_pump())
         # When (if ever) the session closes under us, against the data: a relay that drops
         # a subscriber mid-run looks different from an idle close after the data ended.
         closed_at = None
@@ -802,6 +1054,28 @@ async def run_sub(a):
         # no retransmitted-byte counter, and the retransmitting sender is the relay, so
         # the retransmission share is NOT derived from this.
         pq = []
+        # --ts-out: the relay's Largest Location for the source track, by TRACK_STATUS every
+        # few seconds, so a subscriber the relay stopped sending to still knows how far the
+        # track went (TsReassembler.track_end counts the rest as lost)
+        track_status = []
+        async def poll_status():
+            while True:
+                try:
+                    ok = await asyncio.wait_for(session.track_status(
+                        namespace=a.ns, track_name=a.source_track, wait_response=True), 2.0)
+                    loc = (getattr(ok, "parameters", None) or {}).get(0x09)
+                    if loc is None and getattr(ok, "largest_group_id", None) is not None:
+                        loc = (ok.largest_group_id, ok.largest_object_id)
+                    if loc is not None:
+                        g, o = (loc.group, loc.object) if hasattr(loc, "group") else tuple(loc)[:2]
+                        track_status.append((time.monotonic(), int(g), int(o)))
+                    elif not track_status:
+                        track_status.append((time.monotonic(), None, repr(ok)[:200]))
+                except Exception as exc:          # noqa: BLE001  no answer: the relay is gone
+                    if not track_status or track_status[-1][1] is not None:
+                        track_status.append((time.monotonic(), None, repr(exc)[:200]))
+                await asyncio.sleep(3.0)
+        status_task = asyncio.ensure_future(poll_status()) if reasm is not None else None
         t_end = time.monotonic() + a.duration
         while time.monotonic() < t_end:
             if closed_at is None and session._close_err is not None:
@@ -813,6 +1087,18 @@ async def run_sub(a):
             await asyncio.sleep(0.25)
         if adapt_task is not None:
             adapt_task.cancel()
+        if status_task is not None:
+            status_task.cancel()
+        if ts_task is not None:
+            ts_task.cancel()
+            reasm.poll(time.monotonic(), tsout.write, final=True)
+            ends = [x for x in track_status if x[1] is not None]
+            if ends:
+                # PUBLISH_DONE "track ended" (status 2): the publisher finished the track
+                pd = getattr(tracks.get(a.source_track), "publish_done", None)
+                reasm.track_end(ends[-1][1], ends[-1][2],
+                                track_ended=getattr(pd, "status_code", None) == 2)
+            tsout.close()
         # Did the relay end any subscription or the session before we left?
         last_data = max((r[4] for r in recs), default=None)
         ended = {n: repr(getattr(t, "publish_done", None))
@@ -845,9 +1131,36 @@ async def run_sub(a):
         f.write("track,group,object,mode,t_rel_s,bytes\n")
         for tr, g, o, m, t, p in recs:
             f.write(f"{tr},{g},{o},{m},{t - (first_t or t):.6f},{len(p)}\n")
+    if reasm is not None:
+        ws = sorted(reasm.waits)
+        pct = (lambda p: round(ws[min(len(ws) - 1, int(p * len(ws)))], 4)) if ws else (lambda p: None)
+        st = dict(reasm.stats, max_hold_s=round(reasm.max_hold_s, 3), window_s=a.ts_window,
+                  wait_p50_s=pct(0.5), wait_p95_s=pct(0.95), wait_p99_s=pct(0.99),
+                  wait_p999_s=pct(0.999), wait_max_s=round(ws[-1], 4) if ws else None,
+                  hold_top=sorted(reasm.holds, key=lambda x: -x[2])[:10],
+                  fetch=a.ts_fetch, fetch_wait_s=a.ts_fetch_wait, lost_ids=reasm.lost,
+                  fetches=len(fetch_log), fetch_log=fetch_log, out=a.ts_out,
+                  track_status=track_status[-5:], track_status_n=len(track_status))
+        # time to the first output bytes, from the first SUBSCRIBE (late-join measurements)
+        t_sub = min((r["t_mono"] for r in sub_requests), default=None)
+        if t_sub is not None:
+            st["timeline_from_subscribe"] = [(round(t - t_sub, 4), n) for t, n in tsout.timeline]
+        with open(os.path.join(a.out, f"{a.label}.tsout.json"), "w") as f:
+            json.dump(st, f, indent=1)
+        say(f"TS-OUT {a.label} -> {a.ts_out}: objects {st['objects_out']} (direct {st['direct']}, "
+            f"fec {st['fec']}, fetched {st['fetched']}), lost {st['lost']}"
+            f"{' + ~%d never seen (output stopped at %s, track at %s)' % (st['lost_unseen_est'], st['truncated_at'], st['track_end']) if 'truncated_at' in st else ''}"
+            f", late-dropped {st['late']}, "
+            f"blocks {st['blocks_out']} (decoded {st['blocks_decoded']}), fetch requests "
+            f"{st['fetch_requests']}, groups skipped {st['groups_skipped']}, bytes {st['bytes_out']}, "
+            f"object wait arrival->write p50/p99/p99.9/max {st['wait_p50_s']}/{st['wait_p99_s']}/"
+            f"{st['wait_p999_s']}/{st['wait_max_s']} s; block hold max {st['max_hold_s']} s, worst "
+            f"{[(g, q, round(h, 3)) for g, q, h in st['hold_top'][:3]]}")
+        for g, o in reasm.lost[:50]:
+            say(f"TS-LOST group={g} object={o}")
     print_modes(meta, recs)
     print_streams(meta)
-    if a.deadlines:
+    if a.deadlines and reasm is None:
         report(meta, recs, a.deadlines, os.path.join(a.out, f"{a.label}.result.json"))
     # Last line, deliberately: the orchestrator collects results as soon as it sees
     # this, so everything above must already be on disk.
@@ -1350,6 +1663,10 @@ def main():
         q.add_argument("--insecure", action="store_true", help="skip TLS verification of the relay")
         q.add_argument("--ns", required=True, help="per-run namespace, one token")
         q.add_argument("--seed", type=int, default=7)
+        q.add_argument("--tracemalloc", type=float, default=0.0, metavar="S",
+                       help="diagnostic: trace Python allocations and every S s write RSS, the "
+                            "traced total and the top allocators by line, as growth since the "
+                            "first snapshot, to OUT/tracemalloc.txt (slows the process)")
         q.add_argument("--blocks", type=int, default=10)
         q.add_argument("--warmup", type=int, default=0,
                        help="unmeasured blocks sent before the measured ones (groups 0..warmup-1)")
@@ -1359,6 +1676,10 @@ def main():
                             "one media timeline, an I-frame every N objects of the stream, cut "
                             "into blocks of --objects regardless (short FEC blocks)")
         q.add_argument("--rungs", type=rungs_arg, default=[0.15, 0.15, 0.15])
+        q.add_argument("--cc", default=None,
+                       choices=["bbr", "bbr1", "cubic", "dcubic", "newreno", "fast", "prague"],
+                       help="picoquic congestion controller for this connection (aiomoqt's "
+                            "congestion_control_algorithm; unset: aiomoqt's default, bbr)")
         q.add_argument("--debug", action="store_true")
 
     q = sp.add_parser("pub")
@@ -1367,15 +1688,60 @@ def main():
     q.add_argument("--gate-file", required=True)
     q.add_argument("--keepalive", type=float, default=0, metavar="SEC",
                    help="QUIC keep-alive (PING) interval, so a session idling until the gate opens isn't "
-                        "dropped on the relay's idle timeout; 0 (default) = off, as before")
+                        "dropped on the relay's idle timeout; 0 (default) = off, as before. Whatever "
+                        "this is, a dead session ends the publisher (SESSION-DEAD, exit status 4)")
     q.add_argument("--gop-frames", type=int, default=0, metavar="N",
                    help="with --media: frames per GOP, a multiple of --objects; each GOP is one MoQ "
                         "group of N / --objects blocks (default: --objects, a block per group)")
+    q.add_argument("--ts", default="", metavar="SRC",
+                   help="MPEG-TS source through GPAC: a .ts file (paced by PCR), avgen (GPAC's "
+                        "synthetic live A/V, encoded and muxed in-process), or a GPAC URL such as "
+                        "udp://host:port; use --objects for the FEC block size in objects")
+    q.add_argument("--ts-rate", type=int, default=None, metavar="BPS",
+                   help="TS mux rate for avgen (default 6000000) and the nominal rate of any TS "
+                        "source (default: a file's mean rate from its PCRs)")
+    q.add_argument("--ts-dur", type=float, default=120.0, metavar="S", help="avgen run time")
+    q.add_argument("--ts-skip-s", type=float, default=0.0, metavar="S",
+                   help="a file: start S s in (at its mean rate, on a TS packet boundary)")
+    q.add_argument("--ts-max-s", type=float, default=0.0, metavar="S",
+                   help="a file: send at most S s of it (at its mean rate; 0 = to the end)")
+    q.add_argument("--pub-sample", type=float, default=0.0, metavar="S",
+                   help="sample the connection (cwnd, in flight, RTT, losses) and the send lanes "
+                        "every S s into pub.samples.json (diagnostic)")
+    q.add_argument("--pub-sample-lanes-only", action="store_true",
+                   help="--pub-sample without reading picoquic (whose reads wake its worker thread)")
+    q.add_argument("--pub-sample-backlog", type=int, default=0, metavar="BYTES",
+                   help="--pub-sample: lanes only until a send lane holds BYTES (queued + held by "
+                        "the transport), then picoquic too")
+    q.add_argument("--ts-packets", type=int, default=None, metavar="N",
+                   help="TS packets per object (default 7; 6 with --source-mapping datagram, the "
+                        "most under the 1,152 B datagram ceiling)")
+    q.add_argument("--ts-psi-each-group", nargs="?", const="insert", choices=["insert", "replace"],
+                   default=None, metavar="insert|replace",
+                   help="start every group with copies of the last PAT and PMT (msfts SHOULD; "
+                        "duplicate packets, so the program is unchanged but the bytes differ). insert "
+                        "(the default mode) adds them at the group start; replace puts each in place of "
+                        "the first null packet after it, keeping the rate and PCR positions, and skips "
+                        "(and logs) a copy with no null packet within --ts-psi-null-window packets. "
+                        "Default: off for a file or a URL source (carried unmodified, byte-identical), "
+                        "insert for avgen (we write the mux)")
+    q.add_argument("--no-ts-psi-each-group", dest="ts_psi_each_group", action="store_const", const="off",
+                   help="no PAT/PMT copies")
+    q.add_argument("--ts-psi-null-window", type=int, default=100, metavar="PACKETS",
+                   help="with --ts-psi-each-group replace: how many packets after a group start a "
+                        "null packet may be taken from (default 100)")
+    q.add_argument("--send-times", action=argparse.BooleanOptionalAction, default=None,
+                   help="record when each object of every track was produced, handed to the session "
+                        "and written (pub.sends.pkl, for analyze --clock send); one entry per object "
+                        "for the whole run. Default: on, off for a TS source")
+    q.add_argument("--ts-gpac-child", action="store_true",
+                   help="live source: run the GPAC session (Python bindings) in a child process "
+                        "instead of a thread of this one")
     q.add_argument("--media", default="", metavar="MP4",
                    help="Shaka phase 2: real LOC video frames from this mp4 as the source objects, one GOP "
                         "(--objects frames, keyframe first) per block, and an MSF catalog track")
     q.add_argument("--plain-track", default="video", metavar="NAME",
-                   help="with --media: the plain track's name (notes/three-track-catalog.md): the same "
+                   help="with --media: the plain track's name: the same "
                         "frames as bare LOC on a stream per group, for players without FEC")
     q.add_argument("--no-plain", dest="plain_track", action="store_const", const="",
                    help="with --media: leave the plain track out (catalog and SUBSCRIBE), for comparison runs")
@@ -1460,6 +1826,18 @@ def main():
                         "missing source symbols, unsubscribe after 10 clean blocks (arm B)")
     q.add_argument("--stop-decoded", action="store_true",
                    help="STOP_SENDING a block's remaining streams once it holds k symbols")
+    q.add_argument("--ts-out", default="", metavar="DST",
+                   help="write the source track as MPEG-TS after FEC (and FETCH): a file, - for "
+                        "stdout, or udp://host:port (7 TS packets per datagram)")
+    q.add_argument("--arrival-sizes", action="store_true",
+                   help="keep only each arrival's size, not its payload, in the arrivals record: "
+                        "a long TS run's payloads outgrow a small VM's memory (analyze then can't "
+                        "rebuild blocks from it)")
+    q.add_argument("--ts-window", type=float, default=0.5, metavar="S",
+                   help="--ts-out: how long a block may wait for its objects or repair")
+    q.add_argument("--ts-fetch", action=argparse.BooleanOptionalAction, default=True,
+                   help="--ts-out: FETCH what FEC could not repair, then wait --ts-fetch-wait")
+    q.add_argument("--ts-fetch-wait", type=float, default=0.5, metavar="S")
     q.add_argument("--source-track", default=SOURCE_TRACK,
                    help="source track to subscribe: src, or sym for the mirror family")
 
@@ -1477,10 +1855,59 @@ def main():
         return run_analyze(a)
     if a.role == "sub" and not 0 <= a.take <= len(a.rungs):
         p.error(f"--take must be 0..{len(a.rungs)}")
+    if a.role == "sub" and getattr(a, "ts_out", "") == "-":
+        # the TS goes to stdout (fecmoq.ts.TsOutput takes sys.__stdout__), so every log line
+        # goes to stderr, e.g. ... sub --ts-out - | ffplay -
+        sys.stdout = sys.stderr
     set_log_level(logging.DEBUG if a.debug else logging.WARNING)
     if not a.debug:
         keep_control_lines()
+    if getattr(a, "tracemalloc", 0):
+        start_tracemalloc(a.tracemalloc, a.out)
     asyncio.run(run_pub(a) if a.role == "pub" else run_sub(a))
+
+
+def start_tracemalloc(every_s: float, out_dir: str, top: int = 25) -> None:
+    """--tracemalloc: a daemon thread that snapshots the traced Python heap every `every_s` s
+    and appends, to OUT/tracemalloc.txt, the process RSS, the traced total and the `top`
+    lines whose allocations grew most since the first snapshot. RSS growing while the traced
+    total stays flat points outside the Python heap (picoquic, the C coders, the allocator)."""
+    import threading
+    import tracemalloc
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "tracemalloc.txt")
+    tracemalloc.start(1)
+    t0 = time.monotonic()
+
+    def rss_kb() -> int:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+        return 0
+
+    def run():
+        base = None
+        while True:
+            time.sleep(every_s)
+            snap = tracemalloc.take_snapshot().filter_traces(
+                [tracemalloc.Filter(False, tracemalloc.__file__)])
+            cur, peak = tracemalloc.get_traced_memory()
+            t = time.monotonic() - t0
+            with open(path, "a") as f:
+                f.write(f"== t={t:.0f}s rss={rss_kb() / 1024:.1f}MB traced={cur / 2**20:.1f}MB "
+                        f"peak={peak / 2**20:.1f}MB\n")
+                if base is None:
+                    for st in snap.statistics("lineno")[:top]:
+                        f.write(f"  {st.size / 2**20:8.2f}MB {st.count:9d} {st.traceback}\n")
+                else:
+                    for st in snap.compare_to(base, "lineno")[:top]:
+                        f.write(f"  {st.size_diff / 2**20:+8.2f}MB {st.count_diff:+9d} "
+                                f"now {st.size / 2**20:8.2f}MB {st.traceback}\n")
+            if base is None:
+                base = snap
+
+    threading.Thread(target=run, name="tracemalloc", daemon=True).start()
 
 
 def keep_control_lines():

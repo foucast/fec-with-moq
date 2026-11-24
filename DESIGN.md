@@ -10,9 +10,10 @@ The relay is unmodified and never learns that FEC exists. Everything here uses o
 
 One namespace (`fecmoq` by default) holds:
 
-1. **The source track** (`src`): the media objects themselves, unchanged in meaning. A player that knows nothing about FEC can play it.
+1. **The source track** (`src`): the media objects themselves, unchanged in meaning.
 2. **The repair tracks** (`rep1`, `rep2`, … `repN`), one per *rung* of a protection ladder.
-3. **The catalog** (`catalog`), when publishing real media: an MSF catalog that describes the source track as LOC video and carries the FEC parameters (see "The catalog").
+3. **The catalog** (`catalog`), when publishing real media: an MSF catalog with the FEC parameters (see "The catalog").
+4. **A plain track** (`video`), when publishing real media: the same frames as ordinary LOC on a stream per group, which any player plays without knowing about FEC.
 
 A subscriber chooses its protection by choosing which repair tracks to SUBSCRIBE to, with nothing else: no feedback to the publisher and no per-receiver state in the relay. A viewer on a clean path takes `src` alone; a viewer on a lossy path adds `rep1`, or `rep1` and `rep2`, and so on. Only the viewers who need protection pay for it in bandwidth.
 
@@ -58,7 +59,11 @@ If a block still can't be recovered from the repair that arrived, the receiver c
 
 ## The catalog
 
-With real media, the publisher sends an MSF catalog. The source track is listed as LOC video that an ordinary player can configure a decoder from, with the FEC parameters attached (code, symbol size, objects per block, rung names and fractions, and how objects map onto groups). The repair tracks are listed under an unregistered packaging (`x-fec-repair`), so a player without FEC support skips them.
+With real media, the publisher sends an MSF catalog (version `draft-02`) with three kinds of track: the plain track as `packaging: loc`, which an ordinary player selects and plays; the source track as `x-fec-source`, the same frames as FEC source symbols on datagrams; and the repair tracks as `x-fec-repair`. Both FEC packagings are unregistered, so a player without FEC support skips them. The FEC parameters (code, symbol size, objects per block, block duration, blocks per group, object stride, rung count, and the plain track's name) are in the source track's `packagingMetadata` (MSF-02 §5.2.5, `key=value;...`); each repair track's names its source, its rung and its fraction. A FEC-aware player selects the plain track as usual, then subscribes to the source track named for it instead, and to as many repair tracks as it wants. README.md lists the keys.
+
+## MPEG-TS
+
+A transport stream is a source track like any other: objects of whole TS packets (draft-gregoire-moq-msfts-02), a group per random access point, and FEC blocks of consecutive objects within a group. A file is carried byte for byte and paced by its PCR. The subscriber writes the TS back out in order once each block is complete or its window has passed, filling what FEC couldn't recover by FETCH. With the source objects on datagrams, an object is either on time, recovered by FEC, or fetched, and a group's end is signalled by END_OF_GROUP status objects as well as by the repair headers.
 
 ## Not covered yet
 

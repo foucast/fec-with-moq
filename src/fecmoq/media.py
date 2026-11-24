@@ -179,7 +179,7 @@ def catalog_json(media: Mp4Gops, *, n_objects: int, gap_s: float, rungs: list[fl
                  symbol_size: int, source: str = "src", object_stride: int = 256,
                  plain: str | None = "video") -> bytes:
     """The MSF catalog (version draft-02: it uses packagingMetadata, MSF-02 §5.2.5), three kinds
-    of track (notes/three-track-catalog.md):
+    of track:
 
     - `plain` (omitted when None): LOC video on a stream per group, for every player;
     - `source`: the frames as FEC source symbols on datagrams, packaging `x-fec-source`;

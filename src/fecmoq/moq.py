@@ -667,11 +667,22 @@ class GroupRepairTrack(RepairTrack):
 # aiomoqt's fan-out lanes unchanged and is stripped here, so nothing of it reaches the
 # wire. aiomoqt itself is unchanged.
 EOG_MARK = {"fecmoq-end-of-group": True}
+# Only the END_OF_GROUP status datagram, at the object id written (the TS source closes a
+# group once the next one has started, after its last object went out)
+EOG_ONLY = {"fecmoq-end-of-group-only": True}
 
 
 class EogDatagramDelivery(SubgroupDelivery):
     async def write(self, group_id, object_id, payload, *, extensions=None, group_start=False,
                     encoded=None):
+        if extensions is EOG_ONLY or (isinstance(extensions, dict) and "fecmoq-end-of-group-only" in extensions):
+            from aiomoqt.messages.data import ObjectDatagram
+            from aiomoqt.types import ObjectStatus
+            eog = ObjectDatagram(track_alias=self.track_alias, group_id=group_id,
+                                 object_id=object_id, publisher_priority=self.priority,
+                                 status=ObjectStatus.END_OF_GROUP, payload=b"")
+            await self.session.dgram_write_drain(eog.serialize(prof=self._prof))
+            return True
         if extensions is EOG_MARK or (isinstance(extensions, dict) and "fecmoq-end-of-group" in extensions):
             from aiomoqt.messages.data import ObjectDatagram
             dgram = ObjectDatagram(track_alias=self.track_alias, group_id=group_id,
@@ -708,6 +719,7 @@ class FetchSpec:
     """What one track writes, as a FETCH has to repeat it."""
     kind: str                         # source | mirror | repair
     source_mapping: str = "group"     # source: group | object | datagram | symbol-object | symbol-subgroup
+    #                                   | object-datagram (TS: one object per datagram)
     mapping: StreamMapping = StreamMapping.DATAGRAM   # mirror and repair
     rung: int = 0
     per_rung_ids: bool = False
@@ -723,12 +735,20 @@ def track_objects(sch, spec: FetchSpec, b: int) -> list[tuple]:
     from aiomoqt.types import ObjectStatus
     eog = ObjectStatus.END_OF_GROUP
     out = []
-    if spec.kind == "source" and spec.source_mapping in ("group", "object"):
+    if spec.kind == "source" and spec.source_mapping in ("group", "object", "object-datagram"):
         objs = sch.block(b)
+        # (group, object) from the schedule: (b, i) for one block per group; the TS schedule
+        # (fecmoq.ts_moq) puts several variable-length blocks in a group
+        g = o = None
         for i, obj in enumerate(objs):
-            out.append((b, i, 0 if spec.source_mapping == "group" else i, obj, None))
-        if spec.source_mapping == "group":
-            out.append((b, len(objs), 0, b"", eog))
+            g, o, _ = sch.address(b, i) if hasattr(sch, "group_of") else (b, i, i == 0)
+            out.append((g, o, {"group": 0, "object": o, "object-datagram": None}[spec.source_mapping],
+                        obj, None))
+        ends = getattr(sch, "block_ends_group", None)
+        if spec.source_mapping == "group" and objs and (ends is None or ends(b)):
+            out.append((g, o + 1, 0, b"", eog))
+        if spec.source_mapping == "object-datagram" and objs and ends is not None and ends(b):
+            out.append((g, o + 1, None, b"", eog))     # the TS source's END_OF_GROUP datagram
         return out
     if spec.kind in ("source", "mirror"):
         objs = sch.block(b)
@@ -786,13 +806,18 @@ class ScheduleHistory:
         """The group ids block b's objects use, inclusive."""
         if self.spec.kind == "repair" and self.spec.group_per_symbol:
             return b * GROUP_STRIDE, b * GROUP_STRIDE + GROUP_STRIDE - 1
-        g = b // getattr(self.sch, "blocks_per_group", 1)
+        if hasattr(self.sch, "group_of"):
+            g = self.sch.group_of(b)
+        else:
+            g = b // getattr(self.sch, "blocks_per_group", 1)
         return g, g
 
     def _group_last(self, g: int) -> int:
         """The largest object id the track writes in group g (0 if none)."""
         if self.spec.kind == "repair" and self.spec.group_per_symbol:
             blocks = [g // GROUP_STRIDE]
+        elif hasattr(self.sch, "blocks_of_group"):
+            blocks = [b for b in self.sch.blocks_of_group(g) if b <= self.sch.last_out]
         else:
             bpg = getattr(self.sch, "blocks_per_group", 1)
             blocks = range(g * bpg, g * bpg + bpg)

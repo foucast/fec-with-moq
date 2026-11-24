@@ -1,4 +1,4 @@
-"""The three-track catalog (notes/three-track-catalog.md): a plain LOC track for every player, the
+"""The three-track catalog: a plain LOC track for every player, the
 datagram source track and the repair rungs, with the FEC parameters in packagingMetadata; and the
 plain track's objects. Runs without an mp4: the media is a synthetic stand-in."""
 import asyncio
