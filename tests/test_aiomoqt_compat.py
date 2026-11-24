@@ -24,9 +24,29 @@ def test_lane_item_has_aiomoqts_shape():
     lane = _Lane()
     fan.lanes.append(lane)
     asyncio.run(fan.write(3, 4, b"x", extensions=None, group_start=True))
+    theirs = lane.items[0]
     ours = fmoq.lane_item(3, 4, b"x", None, True, 0.0)
-    assert len(ours) == len(lane.items[0])
-    assert ours[:5] == lane.items[0][:5]
+    assert len(ours) == len(theirs)
+    # group, cost, then object, payload, extensions, group start (live and born differ:
+    # a replay is not live, and an untimed fan-out stamps no birth time)
+    assert ours[:2] == theirs[:2]
+    assert ours[4:8] == theirs[4:8]
+
+
+def test_lane_queue_and_idle():
+    """_drained polls SendLane.items, _source_sent SendLane.idle."""
+    from aiomoqt.delivery import SendLane
+    assert isinstance(SendLane.idle, property)
+    assert "self.items" in inspect.getsource(SendLane.__init__)
+
+
+def test_swap_delivery_matches_add_delivery():
+    """_swap_delivery hands FanoutDelivery.add a bool gate and a float/None deadline, as
+    aiomoqt's own _add_delivery does; joining lanes start above the last group."""
+    want = set(inspect.signature(FanoutDelivery.add).parameters)
+    assert {"gate", "deadline", "joining"} <= want
+    src = inspect.getsource(fmoq._swap_delivery)
+    assert "lambda" not in src
 
 
 def test_delivery_overrides_take_every_keyword():

@@ -84,19 +84,32 @@ def rungs_arg(s):
     return [float(x) for x in s.split(",")]
 
 
+def _wt_datagram_publish() -> bool:
+    """aiomoqt sends datagram tracks over WebTransport (0.14 on): the session computes a WT
+    datagram ceiling instead of returning 0."""
+    from aiomoqt.protocol import _MOQTSessionMixin
+    return hasattr(_MOQTSessionMixin, "_wt_datagram_max_payload")
+
+
 def client_for(a):
     r = parse_relay_url(a.relay)
     if not r.use_quic:
-        # aiomoqt cannot send datagrams over WebTransport, so the repair tracks could not
-        # be published at all: the publisher stays on raw QUIC. A subscriber may use WT
-        # (https://...<endpoint path>): aiomoqt receives datagrams there.
-        if a.role != "sub" or not a.relay.startswith("https://"):
-            sys.exit(f"--relay must be moqt:// (raw QUIC; https:// for sub only), got {a.relay!r}")
+        # WebTransport (https://...<endpoint path>). Subscribers receive datagrams there with
+        # any aiomoqt we use; a publisher needs aiomoqt >= 0.14, which sends datagram tracks
+        # over WT (before it, datagram_max_payload() was 0 on WT and the repair tracks could
+        # not start).
+        if not a.relay.startswith("https://"):
+            sys.exit(f"--relay must be moqt:// (raw QUIC) or https:// (WebTransport), got {a.relay!r}")
+        if a.role != "sub" and not _wt_datagram_publish():
+            sys.exit("this aiomoqt cannot publish datagram tracks over WebTransport (needs >= 0.14); "
+                     "use a moqt:// relay for the publisher")
         qlog = getattr(a, "qlog_dir", None)
         if qlog:
             os.makedirs(qlog, exist_ok=True)
+        ka = getattr(a, "keepalive", 0) or None
         return MOQTClient(r.host, r.port, path=r.path or "", use_quic=False,
-                          supported_drafts=a.draft, verify_tls=not a.insecure, qlog_dir=qlog or None)
+                          supported_drafts=a.draft, verify_tls=not a.insecure, qlog_dir=qlog or None,
+                          keep_alive_interval=ka)
     # --qlog-dir: picoquic writes a qlog of this connection (every frame, incl. the
     # MAX_STREAMS credit a subscriber grants). Diagnostic runs only: it costs CPU.
     qlog = getattr(a, "qlog_dir", None)
@@ -150,6 +163,22 @@ def stamp_deliveries(alias_name, sends):
         rec[2] = time.monotonic()
         return sent
     SubgroupDelivery.write = write
+
+    # aiomoqt 0.14.1+: the lane writes an object on an open group stream inline when the
+    # transport takes it now (send_nowait), without write(); hand and done are one moment.
+    orig_nowait = getattr(SubgroupDelivery, "send_nowait", None)
+    if orig_nowait is None:
+        return
+
+    def send_nowait(self, item):
+        sent = orig_nowait(self, item)
+        if sent is not None:
+            t = time.monotonic()
+            rec = sends.setdefault((alias_name.get(self.track_alias, "?"), item[0], item[4]),
+                                   [None, None, None])
+            rec[1] = rec[2] = t
+        return sent
+    SubgroupDelivery.send_nowait = send_nowait
 
 
 def gated(cls, gate, sends):
@@ -230,7 +259,7 @@ async def run_pub(a):
                                       rung_fracs=a.rungs)
         catalog = catalog_json(schedule.media, n_objects=a.objects, gap_s=a.gap, rungs=a.rungs,
                                symbol_size=fsym.SYMBOL_SIZE, source=SOURCE_TRACK,
-                               object_stride=fmoq.OBJECT_STRIDE)
+                               object_stride=fmoq.OBJECT_STRIDE, plain=a.plain_track or None)
         if schedule.blocks_per_group > 1 and (
                 a.source_mapping != "datagram" or a.repair_mapping != "datagram"
                 or a.mirror_mapping != "none" or a.repair_ids == "per-rung"
@@ -239,7 +268,8 @@ async def run_pub(a):
                      "repair only (no mirror, global repair ids)")
         say(f"MEDIA {a.media}: {len(schedule.media.blocks)} blocks of {a.objects}, "
             f"{schedule.blocks_per_group} per group, codec {schedule.media.codec}, "
-            f"largest frame {schedule.media.largest} B; catalog {len(catalog)} B")
+            f"largest frame {schedule.media.largest} B; catalog {len(catalog)} B, "
+            f"plain track {a.plain_track or 'none'}")
     else:
         schedule = fmoq.BlockSchedule(seed=a.seed, n_blocks=total, n_objects=a.objects,
                                       gap_s=a.gap, rung_fracs=a.rungs, gop=a.gop)
@@ -259,6 +289,12 @@ async def run_pub(a):
             # served at once, not gated: a player configures itself from it before the media starts
             def make():
                 return CatalogPublished(session, catalog)
+            prio = a.prio_src
+        elif catalog is not None and a.plain_track and name == a.plain_track:
+            from fecmoq.media import PlainTrack
+            def make():
+                return gated(PlainTrack, gate, sends)(session, name=name, schedule=schedule,
+                                                      n_blocks=total)
             prio = a.prio_src
         elif name == SOURCE_TRACK:
             src_cls = {"group": fmoq.SourceTrack, "object": fmoq.ObjectSourceTrack,
@@ -450,7 +486,9 @@ async def run_pub(a):
         # read, let the worker answer, read again.
         async def wire():
             qc = getattr(session, "_quic", None)
-            if qc is None:
+            # A WebTransport session's _quic is the session itself, with no picoquic
+            # counters: report 0 (relay-bytes.txt still has the wire bytes).
+            if qc is None or not hasattr(qc, "bytes_sent"):
                 return (0, 0)
             qc.bytes_sent
             await asyncio.sleep(0.05)
@@ -1336,6 +1374,11 @@ def main():
     q.add_argument("--media", default="", metavar="MP4",
                    help="Shaka phase 2: real LOC video frames from this mp4 as the source objects, one GOP "
                         "(--objects frames, keyframe first) per block, and an MSF catalog track")
+    q.add_argument("--plain-track", default="video", metavar="NAME",
+                   help="with --media: the plain track's name (notes/three-track-catalog.md): the same "
+                        "frames as bare LOC on a stream per group, for players without FEC")
+    q.add_argument("--no-plain", dest="plain_track", action="store_const", const="",
+                   help="with --media: leave the plain track out (catalog and SUBSCRIBE), for comparison runs")
     q.add_argument("--linger", type=float, default=10.0, help="stay connected after the last block")
     q.add_argument("--out", default="results")
     q.add_argument("--abrupt-exit", action="store_true",

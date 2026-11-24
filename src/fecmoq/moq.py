@@ -71,8 +71,9 @@ def make_block(seed: int, block: int, n_objects: int, gop: int = 0) -> list[byte
 async def _drained(out):
     """Until every subscriber lane of `out` has taken all queued objects. `out` is
     aiomoqt's FanoutDelivery (or a wrapper exposing .lanes); without lanes there is
-    nothing queued here."""
-    while any(lane.queue.qsize() for lane in getattr(out, "lanes", ())):
+    nothing queued here. A SendLane's queue is .items (aiomoqt 0.14.1+; before, an
+    asyncio.Queue at .queue)."""
+    while any(lane.items for lane in getattr(out, "lanes", ())):
         await asyncio.sleep(0.0005)
 
 
@@ -98,7 +99,8 @@ async def _source_sent(out, timeout_s: float) -> tuple[float, bool]:
     while quiet < 2:
         if time.monotonic() - t0 > timeout_s:
             return time.monotonic() - t0, True
-        empty = not any(lane.queue.qsize() for lane in getattr(out, "lanes", ()))
+        # idle: nothing queued and no send in progress (aiomoqt 0.14.1+ SendLane)
+        empty = all(lane.idle for lane in getattr(out, "lanes", ()))
         quiet = quiet + 1 if empty and _stream_bytes_unsent() == 0 else 0
         await asyncio.sleep(0.0005)
     return time.monotonic() - t0, False
@@ -437,6 +439,10 @@ class RepairTrack(PublishedTrack):
             return
         sizes, slices, repair = self.schedule.repair(b)
         lane = self._out.lanes[-1]
+        # A joining lane takes only groups above the last one written (lane.floor);
+        # a datagram lane needs no group boundary, so let it take block b's replay.
+        if lane.floor is not None and lane.floor > b:
+            lane.floor = b
         mine = slices[self.rung - 1]
         born = time.monotonic()
         self.caught_up += 1
@@ -450,10 +456,13 @@ class RepairTrack(PublishedTrack):
 
 
 def lane_item(group_id, object_id, payload, extensions, group_start, born) -> tuple:
-    """One item for an aiomoqt fan-out lane, as FanoutDelivery.write queues it (0.13.2+:
-    group, object, payload, extensions, group start, birth time, shared encoding cache).
-    tests/test_aiomoqt_compat.py checks the shape against aiomoqt's own."""
-    return (group_id, object_id, payload, extensions, group_start, born, None)
+    """One replayed item for an aiomoqt SendLane, as FanoutDelivery.write builds it
+    (0.14.1+: group, cost, live, born, object, payload, extensions, group start, shared
+    encoding cache). A replay is not live, so it doesn't count against the lane's byte
+    bound. tests/test_aiomoqt_compat.py checks the shape against aiomoqt's own."""
+    from aiomoqt.delivery import retained_object_bytes
+    return (group_id, retained_object_bytes(payload, extensions), False, born, object_id,
+            payload, extensions, group_start, None)
 
 
 def _swap_delivery(track, sub, delivery) -> None:
@@ -463,8 +472,8 @@ def _swap_delivery(track, sub, delivery) -> None:
     delivery.passes, delivery.excludes_end = old.passes, old.excludes_end
     track._out.drop_session(sub.session)
     sub.delivery = delivery
-    track._out.add(delivery, gate=lambda: sub.forward and sub.generating,
-                   deadline=lambda: track._delivery_deadline(sub))
+    track._out.add(delivery, gate=bool(sub.forward and sub.generating),
+                   deadline=track._delivery_deadline(sub))
 
 
 class ObjectSourceTrack(SourceTrack):
@@ -572,6 +581,10 @@ class SubgroupByKeyDelivery(SubgroupDelivery):
     FIN on the previous one. Several objects share a stream, unlike PER_OBJECT, and a
     group has several streams, unlike PER_GROUP (which always uses subgroup 0). Built
     on aiomoqt's SubgroupDelivery from the outside; aiomoqt itself is unchanged."""
+
+    # aiomoqt 0.14.1's lane writes an object straight onto the open stream through
+    # send_nowait when it can; that would skip the subgroup switch in write().
+    send_nowait = None
 
     def __init__(self, session, track_alias, *, priority=128, subgroup_of):
         super().__init__(session, track_alias, priority=priority,

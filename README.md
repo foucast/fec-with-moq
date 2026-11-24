@@ -6,7 +6,21 @@ Background, in plain language: the FEC with MoQ article series on LinkedIn, [Par
 
 ## Status
 
-Working end to end: the Python publisher sends real media (source plus repair tracks) through a stock [moqx](https://github.com/openmoq/moqx) relay, and browser players recover lost blocks in stock Chromium and Firefox. The player side is in Playa: branch [`fec-with-moq`](https://github.com/foucast/moq-playa/tree/fec-with-moq) of our fork, which has a demo page with an on-screen FEC counter (see its `FEC-WITH-MOQ.md`). The Shaka Player changes will follow in a fork of Shaka.
+Working end to end: the Python publisher sends real media (source plus repair tracks) through a stock [moqx](https://github.com/openmoq/moqx) relay, and browser players recover lost blocks in stock Chromium and Firefox. The player side is in Playa: branch [`fec-with-moq-v2`](https://github.com/foucast/moq-playa/tree/fec-with-moq-v2) of our fork, on current upstream Playa, with a demo page and an on-screen FEC counter (see its `FEC-WITH-MOQ.md`). The older branch [`fec-with-moq`](https://github.com/foucast/moq-playa/tree/fec-with-moq) (Nov 13) reads the earlier catalog and won't play this publisher's. The Shaka Player changes will follow in a fork of Shaka.
+
+Tested (Nov 22, 2026) with current upstream Playa, moqx 0.3.8+ (`a191e99`) and the public OpenMOQ CI relay. Relays older than moqx 0.3.8 end a WebTransport session that only receives datagrams after 60 s (fixed upstream in [moqx #882](https://github.com/openmoq/moqx/pull/882)), which cuts off a FEC player.
+
+## The catalog: one plain track for every player, plus FEC tracks
+
+The publisher's MSF catalog (version `draft-02`) has three kinds of track, so players without FEC keep working:
+
+| Track | Packaging | Carried as | Who subscribes |
+|---|---|---|---|
+| `video` | `loc` | QUIC streams, one stream per group, one frame per object | any player without FEC |
+| `src` | `x-fec-source` | datagrams: the same frames as FEC source symbols | FEC players |
+| `rep1`..`rep3` | `x-fec-repair` | datagrams: repair, one rung per track | FEC players, as many rungs as their path needs |
+
+The FEC parameters are in each track's `packagingMetadata` (`key=value;...`, MSF-02 §5.2.5), for example (abridged) `scheme=rs-cauchy-gf256;symbolSize=1100;blockObjects=12;rungs=3;plainTrack=video` on `src` and `source=src;rung=1;fraction=0.15` on a repair track. The two `x-` packaging names are placeholders until MSF has a packaging registry. A FEC player selects `video` as usual, then subscribes to `src` and the repair tracks in its place. The relay forwards each viewer only the tracks it asked for, so a plain viewer receives no FEC bytes. `relay_fec.py pub --no-plain` leaves the plain track out, for comparison runs.
 
 Not yet shown: congestion with real cross traffic, bitrate and protection chosen together, content-aware protection, or multicast.
 
