@@ -162,3 +162,31 @@ def test_catalog_is_sent_again_as_new_groups():
     objs = hist.fetch((0, 0), (len(writes) - 1, 0))
     assert objs[0].end_of_range and (objs[0].group_id, objs[0].object_id) == (len(writes) - 2, 0)
     assert [(o.group_id, o.object_id, o.payload) for o in objs[1:]] == [(len(writes) - 1, 0, b"{}")]
+
+
+def test_send_records_are_trimmed_to_a_window():
+    # --send-times-keep: records of objects produced longer ago than the window go, in order
+    import asyncio
+    import importlib.util
+    import os
+    import sys
+    import time
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path[:0] = [os.path.join(root, "src"), os.path.join(root, "vendor", "aiomoqt")]
+    spec = importlib.util.spec_from_file_location("relay_fec", os.path.join(root, "scripts", "relay_fec.py"))
+    rf = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rf)
+
+    now = time.monotonic()
+    sends = {("src", g, 0): [now - 99.5 + g, None, None] for g in range(100)}    # produced 99.5..0.5 s ago
+    sends[("catalog", 0, 0)] = [None, now - 0.5, now - 0.5]                     # handed only, recent
+    trimmed = [0]
+
+    async def run():
+        task = asyncio.create_task(rf.trim_sends(sends, 30.0, trimmed, every_s=0.01))
+        await asyncio.sleep(0.05)
+        task.cancel()
+    asyncio.run(run())
+    assert trimmed[0] == 70
+    assert min(g for _t, g, _o in sends if _t == "src") == 70
+    assert ("catalog", 0, 0) in sends

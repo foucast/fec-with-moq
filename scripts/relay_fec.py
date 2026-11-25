@@ -224,6 +224,24 @@ def stamp_deliveries(alias_name, sends):
     SubgroupDelivery.send_nowait = send_nowait
 
 
+async def trim_sends(sends, keep_s, trimmed, every_s=10.0):
+    """Every `every_s` seconds, drop the send records (see stamp_deliveries) of objects produced
+    more than `keep_s` seconds ago, counting them in trimmed[0]. Records are in production
+    order, so this stops at the first one young enough to keep."""
+    while True:
+        await asyncio.sleep(every_s)
+        cutoff = time.monotonic() - keep_s
+        old = []
+        for k, rec in sends.items():
+            t = next((x for x in rec if x is not None), None)
+            if t is not None and t >= cutoff:
+                break
+            old.append(k)
+        for k in old:
+            del sends[k]
+        trimmed[0] += len(old)
+
+
 def gated(cls, gate, sends):
     class Gated(cls):
         async def produce(self, out):
@@ -460,6 +478,7 @@ async def run_pub(a):
     if a.send_times is None:
         a.send_times = not ts_src
     sends = {} if a.send_times else None
+    trimmed = [0]        # send records dropped by trim_sends()
     alias_name = {}
     if sends is not None:
         stamp_deliveries(alias_name, sends)
@@ -755,6 +774,9 @@ async def run_pub(a):
                     samples.append(row)
                     await asyncio.sleep(a.pub_sample)
             sampler = asyncio.ensure_future(sample())
+        trimmer = None
+        if sends is not None and a.send_times_keep > 0:
+            trimmer = asyncio.ensure_future(trim_sends(sends, a.send_times_keep, trimmed))
         say(f"CODER {schedule.coder} {schedule.encode_mode} repair-after={schedule.repair_after}")
         if ts_src:
             say(f"GATE-OPEN producing the TS: blocks of up to {a.objects} objects, nominal "
@@ -823,6 +845,8 @@ async def run_pub(a):
             with open(os.path.join(a.out, "pub.samples.json"), "w") as f:
                 json.dump(samples, f)
             say(f"  pub samples: {len(samples)} -> pub.samples.json")
+        if trimmer is not None:
+            trimmer.cancel()
         if sends is None:
             sends = {}
         if a.repair_group_per_symbol:
@@ -841,9 +865,11 @@ async def run_pub(a):
                              repair_eog=a.repair_eog, spread_source=a.spread_source, upstream=up,
                              symbol_size=fsym.SYMBOL_SIZE, pace_repair=a.pace_repair,
                              prio_src=a.prio_src, prio_rep=a.prio_rep,
-                             send_times=a.send_times,
+                             send_times=a.send_times, send_times_keep=a.send_times_keep,
+                             sends_trimmed=trimmed[0],
                              sends={k: tuple(v) for k, v in sends.items()}), f)
         say(f"  send times recorded for {len(sends)} objects -> {a.out}/pub.sends.pkl"
+            + (f" ({trimmed[0]} older ones trimmed: --send-times-keep {a.send_times_keep:g})" if trimmed[0] else "")
             + ("" if a.send_times else " (off: --no-send-times, the default for a TS source)"))
         enc = sorted(schedule.encode_s.values())
         tot = sorted(schedule.encode_total_s.values())
@@ -1815,7 +1841,10 @@ def main():
     q.add_argument("--send-times", action=argparse.BooleanOptionalAction, default=None,
                    help="record when each object of every track was produced, handed to the session "
                         "and written (pub.sends.pkl, for analyze --clock send); one entry per object "
-                        "for the whole run. Default: on, off for a TS source")
+                        "for the last --send-times-keep seconds. Default: on, off for a TS source")
+    q.add_argument("--send-times-keep", type=float, default=600.0, metavar="S",
+                   help="keep the send records of the last S seconds only (trimmed every 10 s), so a "
+                        "long run's memory stays flat; 0 keeps every record")
     q.add_argument("--ts-gpac-child", action="store_true",
                    help="live source: run the GPAC session (Python bindings) in a child process "
                         "instead of a thread of this one")
