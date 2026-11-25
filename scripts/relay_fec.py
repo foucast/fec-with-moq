@@ -234,15 +234,69 @@ def gated(cls, gate, sends):
 
 
 class CatalogPublished(fmoq.PublishedTrack):
-    """The MSF catalog as one Object (group 0, object 0) on a subgroup stream (--media)."""
+    """The MSF catalog (--media): one Object (object 0) per group, each group on its own subgroup
+    stream, sent again as a new group every `interval` seconds for the whole run.
+
+    The relay holds one upstream subscription for all its subscribers, and a player that joins it
+    later receives only objects sent after it joined; aiomoqt shares one production between the
+    relay's subscriptions, so a catalog sent once, at the first SUBSCRIBE, reached only the first
+    player. Repeating it, a SUBSCRIBE that arrives at any time gets the catalog within `interval`."""
     mapping = fmoq.StreamMapping.PER_GROUP
 
-    def __init__(self, session, blob: bytes):
+    def __init__(self, session, blob: bytes, interval: float, history: "CatalogHistory"):
         super().__init__(session, fmoq.NAMESPACE, "catalog")
         self.blob = blob
+        self.interval = interval
+        self.history = history
 
     async def produce(self, out):
-        await out.write(0, 0, self.blob, group_start=True)
+        group = 0
+        while True:
+            await out.write(group, 0, self.blob, group_start=True)
+            self.history.group = group
+            group += 1
+            await asyncio.sleep(self.interval)
+
+
+class CatalogHistory:
+    """aiomoqt's ObjectHistory interface (as fmoq.ScheduleHistory) for the catalog: it holds the
+    latest group CatalogPublished sent, so a FETCH for the catalog -- the Joining FETCH that
+    Playa's default catalogBootstrap ('auto', MSF-01 section 5) sends with its SUBSCRIBE -- is
+    answered with the current catalog. Older groups have left: End of Unknown Range."""
+
+    def __init__(self, blob: bytes, priority: int = 128):
+        self.blob, self.priority = blob, priority
+        self.group = None                 # the latest group sent; None before the first
+        self.last = None                  # (objects, markers, first, last) of the last fetch()
+
+    def largest(self):
+        return None if self.group is None else (self.group, 0)
+
+    @property
+    def evicted_through(self):
+        return (self.group - 1, 0) if self.group else None
+
+    def last_object(self, group_id: int):
+        return 0 if group_id == self.group else None
+
+    def fetch(self, start, end, session=None, *, descending=False, lost_marker=None):
+        from aiomoqt.messages.data import FETCH_FLAGS_END_UNKNOWN, FetchObject
+        from aiomoqt.types import ObjectStatus
+        out, lost = [], None
+        through = self.evicted_through
+        if through is not None and start <= through:
+            lost = min(through, end)
+        if self.group is not None and start <= (self.group, 0) <= end:
+            out.append(FetchObject(group_id=self.group, subgroup_id=0, object_id=0,
+                                   publisher_priority=self.priority, payload=self.blob,
+                                   status=ObjectStatus.NORMAL, datagram=False))
+        n = len(out)
+        if lost is not None:
+            out.insert(len(out) if descending else 0,
+                       FetchObject(group_id=lost[0], object_id=lost[1],
+                                   end_of_range=lost_marker or FETCH_FLAGS_END_UNKNOWN))
+        self.last = (n, int(lost is not None), start, end)
+        return out
 
 
 class PrioSubscribedTrack(SubscribedTrack):
@@ -390,6 +444,7 @@ async def run_pub(a):
         schedule = fmoq.BlockSchedule(seed=a.seed, n_blocks=total, n_objects=a.objects,
                                       gap_s=a.gap, rung_fracs=a.rungs, gop=a.gop)
         catalog = None
+    catalog_history = CatalogHistory(catalog, a.prio_src) if catalog is not None else None
     # --ts: the number of blocks comes from the stream, not from --warmup/--blocks; the tracks
     # run until the TS ends (TsSchedule.n_blocks is open-ended)
     common = dict(seed=a.seed, n_blocks=schedule.n_blocks if ts_src else total,
@@ -413,7 +468,7 @@ async def run_pub(a):
         if name == "catalog" and catalog is not None:
             # served at once, not gated: a player configures itself from it before the media starts
             def make():
-                return CatalogPublished(session, catalog)
+                return CatalogPublished(session, catalog, a.catalog_interval, catalog_history)
             prio = a.prio_src
         elif catalog is not None and a.plain_track and name == a.plain_track:
             from fecmoq.media import PlainTrack
@@ -540,6 +595,8 @@ async def run_pub(a):
         return None, None
 
     def fetcher(session, name):
+        if name not in fetchers and name == "catalog" and catalog_history is not None:
+            fetchers[name] = fmoq.FetchServer(session, name, catalog_history)
         if name not in fetchers:
             spec, prio = fetch_spec(name)
             fetchers[name] = spec and fmoq.FetchServer(
@@ -548,8 +605,9 @@ async def run_pub(a):
 
     async def on_fetch(session, msg):
         """Repair by FETCH (design note 5.5), standalone or joining, for the source track, the
-        mirror and every rung. Whatever is not ours (the catalog, an unknown name, a joining FETCH
-        for no subscription of ours) gets aiomoqt's own refusal."""
+        mirror and every rung, and the catalog's latest group (CatalogHistory). Whatever is not
+        ours (an unknown name, a joining FETCH for no subscription of ours) gets aiomoqt's own
+        refusal."""
         from aiomoqt.types import FetchType
         try:
             ftype = FetchType(msg.fetch_type).name.lower()
@@ -567,6 +625,9 @@ async def run_pub(a):
             await session._handle_fetch(msg)
             return
         if joining:
+            if anchor is None and name == "catalog":
+                # SUBSCRIBE came before the first catalog group was sent: join at the latest now
+                anchor = fs._largest
             fs._sub_for(session).joining[msg.joining_request_id] = anchor
         fs._done = schedule.last_out >= schedule.n_blocks - 1
         fs._history.last = None
@@ -1740,6 +1801,9 @@ def main():
     q.add_argument("--media", default="", metavar="MP4",
                    help="Shaka phase 2: real LOC video frames from this mp4 as the source objects, one GOP "
                         "(--objects frames, keyframe first) per block, and an MSF catalog track")
+    q.add_argument("--catalog-interval", type=float, default=2.0, metavar="S",
+                   help="send the catalog (--media, --ts) again as a new group every S seconds, so a "
+                        "player joining at any time gets it")
     q.add_argument("--plain-track", default="video", metavar="NAME",
                    help="with --media: the plain track's name: the same "
                         "frames as bare LOC on a stream per group, for players without FEC")

@@ -125,3 +125,40 @@ def test_plain_track_joins_at_the_next_gop(schedule):
     assert _plain(schedule, 30)._first_block() == 10
     schedule.t_start = None
     assert _plain(schedule, 30)._first_block() == 0
+
+
+def test_catalog_is_sent_again_as_new_groups():
+    # A player joining a subscription the relay already holds gets only what is sent after it
+    # joins, so the catalog repeats: object 0 of group 0, 1, 2, ... every interval
+    import asyncio
+    import importlib.util
+    import os
+    import sys
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path[:0] = [os.path.join(root, "src"), os.path.join(root, "vendor", "aiomoqt")]
+    spec = importlib.util.spec_from_file_location("relay_fec", os.path.join(root, "scripts", "relay_fec.py"))
+    rf = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rf)
+
+    writes = []
+
+    class Out:
+        async def write(self, group_id, object_id, payload, *, group_start=False, **_):
+            writes.append((group_id, object_id, payload, group_start))
+
+    hist = rf.CatalogHistory(b"{}")
+    track = rf.CatalogPublished(None, b"{}", interval=0.01, history=hist)
+
+    async def run():
+        task = asyncio.create_task(track.produce(Out()))
+        await asyncio.sleep(0.1)
+        task.cancel()
+    asyncio.run(run())
+    assert len(writes) >= 3
+    assert [w[0] for w in writes] == list(range(len(writes)))
+    assert all(w[1:] == (0, b"{}", True) for w in writes)
+    # a FETCH (Playa's Joining FETCH) gets the latest group, the older ones as one End of Range
+    assert hist.largest() == (len(writes) - 1, 0)
+    objs = hist.fetch((0, 0), (len(writes) - 1, 0))
+    assert objs[0].end_of_range and (objs[0].group_id, objs[0].object_id) == (len(writes) - 2, 0)
+    assert [(o.group_id, o.object_id, o.payload) for o in objs[1:]] == [(len(writes) - 1, 0, b"{}")]
