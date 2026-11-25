@@ -9,7 +9,7 @@ if [ ! -f vendor/aiomoqt/pyproject.toml ]; then
 fi
 
 # The default coder (ISA-L) needs the system library.
-if ! ldconfig -p 2>/dev/null | grep -q libisal; then
+if ! ldconfig -p 2>/dev/null | grep libisal >/dev/null; then
   echo "ISA-L not found: sudo apt install libisal-dev"
   exit 1
 fi
