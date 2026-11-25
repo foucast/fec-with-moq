@@ -453,6 +453,7 @@ async def run_pub(a):
     rung_of = {repair_track_name(r): r for r in range(1, len(a.rungs) + 1)}
     served = {}
     ending = []          # (track, session, relay request id) to end at exit
+    current = {}         # track name -> the relay's SUBSCRIBE request id it is delivering to
     # (track, group, object) -> [t_produce, t_hand, t_done], monotonic: one entry per object
     # of every track, kept to the end of the run (it grows with the object rate). Off by default for
     # a TS source, whose checks don't read it (--send-times turns it on)
@@ -557,16 +558,36 @@ async def run_pub(a):
         # Location now (aiomoqt's PublishedTrack records the same in its own _on_subscribe).
         fs = fetcher(session, name)
         joins[msg.request_id] = (name, fs._largest if fs else None)
-        # Log (only) when the relay cancels this upstream subscription: d16 UNSUBSCRIBE, or
-        # a terminated request stream at d18. Answers "does the relay drop its upstream
-        # subscription to a rung once no subscriber wants it?"
+        # When the relay ends this upstream subscription (d16 UNSUBSCRIBE, or a terminated
+        # request stream at d18): log it and stop delivering to it (unsubscribed()).
         t_sub = time.monotonic()
+        current[name] = msg.request_id
         session.register_request_cancel_handler(
             msg.request_id,
-            lambda rid, name=name, t_sub=t_sub: say(
-                f"UPSTREAM-UNSUBSCRIBE wall={time.time():.3f} {name} request_id={rid} "
-                f"{time.monotonic() - t_sub:.1f}s after its SUBSCRIBE"))
+            lambda rid, name=name, t_sub=t_sub, track=track: unsubscribed(session, track, name, rid, t_sub))
         await track.generate(session, ok.track_alias)
+
+    def unsubscribed(session, track, name, rid, t_sub):
+        """The relay ended subscription `rid` to track `name`. Stop delivering it at once: no
+        more objects, and the group still open for it is reset now (drop_session), while
+        nothing else is subscribed. Left alone, aiomoqt's shared production kept sending
+        groups under the ended alias (the relay logs "Timed out waiting for subscription
+        state" for each), and reset that open group only when the relay's next SUBSCRIBE
+        replaced the delivery; moqx took that reset, arriving after its new SUBSCRIBE, as
+        the publisher ending the new subscription ("Subscription replaced by reconnecting
+        publisher", then "Publish after publishDone"), and the player that had just
+        subscribed got nothing. A SUBSCRIBE that already replaced `rid` is left alone."""
+        live = current.get(name) == rid
+        say(f"UPSTREAM-UNSUBSCRIBE wall={time.time():.3f} {name} request_id={rid} "
+            f"{time.monotonic() - t_sub:.1f}s after its SUBSCRIBE"
+            f"{'' if live else ' (already replaced: nothing to stop)'}")
+        ending[:] = [e for e in ending if not (e[0] is track and e[2] == rid)]
+        if not live:
+            return
+        del current[name]
+        track._sub_for(session).generating = False
+        if track._out is not None:
+            track._out.drop_session(session)
 
     fetch_stats = defaultdict(int)
     # FETCH (on by default; --no-serve-fetch for the behaviour before 2026-10-24, aiomoqt's refusal):

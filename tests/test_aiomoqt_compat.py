@@ -56,3 +56,15 @@ def test_delivery_overrides_take_every_keyword():
         have = {n for n, p in inspect.signature(cls.write).parameters.items()
                 if p.kind is p.KEYWORD_ONLY}
         assert want <= have, (cls.__name__, want - have)
+
+
+def test_unsubscribe_reaches_what_it_stops():
+    """relay_fec.py pub's unsubscribed() turns a peer's delivery off with the subscription's
+    generating flag (a setter that gates its send lane) and detaches it with
+    FanoutDelivery.drop_session, which resets the group open for it."""
+    from aiomoqt.track import PublishedTrack, _Subscription
+    assert isinstance(_Subscription.generating, property) and _Subscription.generating.fset
+    assert callable(PublishedTrack._sub_for)
+    assert "_out" in inspect.getsource(PublishedTrack._add_delivery)
+    src = inspect.getsource(FanoutDelivery.drop_session)
+    assert "reset_group" in src and "self.lanes" in src
